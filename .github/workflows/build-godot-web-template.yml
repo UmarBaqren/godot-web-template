@@ -1,0 +1,211 @@
+# Builds a slim Godot 4.7.2 web export template for Slime Drop
+# (2D only, GDExtension / dlink support on, threads off).
+#
+# Setup:
+#   1. Put this file in your repo at .github/workflows/build-godot-web-template.yml
+#      (it replaces the old version).
+#   2. DebugOverlay (test_project/scenes/GameScene.tscn) is a RichTextLabel, and this
+#      build removes the advanced UI nodes from the engine by default. Before running,
+#      either switch that node to a plain Label, or untick "advanced_gui_off" below.
+#      Otherwise GameScene may fail to load. Details: slim-web-template.md
+#   3. Actions tab -> "Build slim Godot web template" -> Run workflow.
+#   4. Download the artifact "web_dlink_release" and set it in Godot under
+#      Export > Web > Custom Template > Release. Keep Extension Support on.
+#
+# The build reads your engine build profile from build_profiles/ in this repo
+# and automatically puts back the classes your game really uses.
+
+name: Build slim Godot web template
+
+on:
+  workflow_dispatch:
+    inputs:
+      lto:
+        description: "Link-time optimization. thin = smaller RAM use, full = smallest file but needs lots of RAM, none = quick test build"
+        type: choice
+        options: [thin, full, none]
+        default: thin
+      build_profile:
+        description: "Path to the engine build profile JSON inside your repo. Leave EMPTY to skip it (bigger template, but nothing can break)."
+        type: string
+        default: "build_profiles/Optimized_1_fixed.json"
+      keep_classes:
+        description: "Classes to remove from the profile's disabled list because your game uses them. If the game says a class is missing, add its name here."
+        type: string
+        default: "Camera2D ButtonGroup Gradient GradientTexture2D"
+      advanced_gui_off:
+        description: "Remove advanced UI nodes (RichTextLabel, Tree, TextEdit, OptionButton, popups, dialogs...). Needs the DebugOverlay node deleted first."
+        type: boolean
+        default: true
+      fallback_text_server:
+        description: "Use the small text server. Fine for Latin, Greek and Cyrillic. Turn OFF if you need Arabic, Hebrew, Thai, Hindi etc."
+        type: boolean
+        default: true
+      modules_on:
+        description: "Engine modules to KEEP (space separated). Everything else is switched off. Add a name here if something breaks."
+        type: string
+        default: "gdscript freetype svg webp jpg regex godot_physics_2d"
+      extra_scons_flags:
+        description: "Optional extra SCons flags, for example: module_jpg_enabled=no"
+        type: string
+        default: ""
+
+env:
+  GODOT_REF: 4.7.2-stable        # must match the editor you export with (commit ed1daf0bf)
+  EM_VERSION: 4.0.11             # Emscripten version the official Godot 4.7.2 CI uses
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Check out Godot source
+        uses: actions/checkout@v7
+        with:
+          repository: godotengine/godot
+          ref: ${{ env.GODOT_REF }}
+          path: godot
+
+      - name: Check out your project (for the build profile)
+        if: ${{ inputs.build_profile != '' }}
+        uses: actions/checkout@v7
+        with:
+          path: project
+
+      - name: Set up Emscripten
+        uses: emscripten-core/setup-emsdk@v16
+        with:
+          version: ${{ env.EM_VERSION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: 3.x
+
+      - name: Set up SCons
+        run: python -m pip install scons==4.10.1
+
+      - name: Prepare the build profile
+        if: ${{ inputs.build_profile != '' }}
+        env:
+          PROFILE: ${{ inputs.build_profile }}
+          KEEP: ${{ inputs.keep_classes }}
+        run: |
+          python - <<'PY'
+          import json, os, sys
+
+          ws = os.environ["GITHUB_WORKSPACE"]
+          src = os.path.join(ws, "project", os.environ["PROFILE"])
+          dst = os.path.join(ws, "patched_profile.json")
+
+          if not os.path.isfile(src):
+              print(f"::error::Build profile not found in your repo: {os.environ['PROFILE']}")
+              sys.exit(1)
+
+          with open(src, encoding="utf-8-sig") as f:
+              data = json.load(f)
+
+          # Classes the engine itself needs to start. Godot's auto-detect sometimes
+          # disables them by mistake, so they are always put back.
+          always_keep = {"MainLoop", "StyleBox", "KinematicCollision2D", "TextServer", "TextServerManager"}
+          keep = always_keep | set(os.environ.get("KEEP", "").split())
+
+          disabled = data.get("disabled_classes", [])
+          put_back = sorted(c for c in disabled if c in keep)
+          data["disabled_classes"] = [c for c in disabled if c not in keep]
+
+          with open(dst, "w", encoding="utf-8") as f:
+              json.dump(data, f, indent="\t")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"PROFILE_PATH={dst}\n")
+
+          lines = [
+              "### Build profile",
+              f"- Source: `{os.environ['PROFILE']}`",
+              f"- Classes still disabled: {len(data['disabled_classes'])}",
+              f"- Put back because the game needs them: {', '.join(put_back) if put_back else 'none'}",
+          ]
+          print("\n".join(lines))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("\n".join(lines) + "\n\n")
+          PY
+
+      - name: Build the template
+        working-directory: godot
+        env:
+          LTO: ${{ inputs.lto }}
+          ADV_GUI_OFF: ${{ inputs.advanced_gui_off }}
+          FALLBACK_TS: ${{ inputs.fallback_text_server }}
+          MODULES_ON: ${{ inputs.modules_on }}
+          EXTRA_FLAGS: ${{ inputs.extra_scons_flags }}
+        run: |
+          set -euo pipefail
+
+          FLAGS="platform=web target=template_release arch=wasm32"
+          FLAGS="$FLAGS dlink_enabled=yes threads=no"
+          FLAGS="$FLAGS production=yes lto=$LTO debug_symbols=no"
+
+          # 2D only, no XR, no accessibility, no compatibility code, no zip support
+          FLAGS="$FLAGS disable_3d=yes disable_physics_3d=yes disable_navigation_3d=yes disable_navigation_2d=yes"
+          FLAGS="$FLAGS disable_xr=yes accesskit=no deprecated=no minizip=no"
+
+          if [ "$ADV_GUI_OFF" = "true" ]; then
+            FLAGS="$FLAGS disable_advanced_gui=yes"
+          fi
+
+          # Module whitelist: everything off except what is listed
+          FLAGS="$FLAGS modules_enabled_by_default=no"
+          for m in $MODULES_ON; do
+            if [ ! -d "modules/$m" ]; then
+              echo "::error::Unknown engine module '$m' (no folder modules/$m in Godot $GODOT_REF)"
+              exit 1
+            fi
+            FLAGS="$FLAGS module_${m}_enabled=yes"
+          done
+
+          # Text server. The small one is off by default in 4.7, so it must be switched on.
+          FLAGS="$FLAGS module_text_server_fb_enabled=yes"
+          if [ "$FALLBACK_TS" != "true" ]; then
+            FLAGS="$FLAGS module_text_server_adv_enabled=yes"
+          fi
+
+          if [ -n "${PROFILE_PATH:-}" ]; then
+            FLAGS="$FLAGS build_profile=$PROFILE_PATH"
+          fi
+
+          if [ -n "$EXTRA_FLAGS" ]; then
+            FLAGS="$FLAGS $EXTRA_FLAGS"
+          fi
+
+          echo "scons $FLAGS"
+          {
+            echo "### SCons flags"
+            echo '```'
+            echo "scons $FLAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          scons -j"$(nproc)" $FLAGS
+
+      - name: Package and report sizes
+        run: |
+          set -e
+          ls -l godot/bin
+          ZIP="$(ls godot/bin/*.zip | head -n 1)"
+          mkdir -p out
+          cp "$ZIP" out/web_dlink_release.zip
+          {
+            echo "### Template built from $GODOT_REF with Emscripten $EM_VERSION"
+            echo '```'
+            unzip -l out/web_dlink_release.zip
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          unzip -l out/web_dlink_release.zip
+
+      - name: Upload template
+        uses: actions/upload-artifact@v7
+        with:
+          name: web_dlink_release
+          path: out/web_dlink_release.zip
+          if-no-files-found: error
